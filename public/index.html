@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Energiemanagement</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand"><span class="bolt">⚡</span> Energiemanagement</div>
+    <input id="projName" class="proj-name" type="text" maxlength="100" placeholder="Name des Systems" title="Name des Systems">
+    <span class="dirty" id="dirty" hidden>●</span>
+    <div class="tb-group">
+      <button class="btn" id="btnNew" title="Neues System">Neu</button>
+      <button class="btn" id="btnOpen" title="Gespeicherte Systeme öffnen">Öffnen</button>
+      <button class="btn primary" id="btnSave" title="Speichern (Strg+S)">Speichern</button>
+      <button class="btn" id="btnSaveAs" title="Als Kopie speichern">Kopie</button>
+      <button class="btn" id="btnPdf" title="Plan und Teileliste als PDF (im Druckdialog „Als PDF speichern" wählen)">PDF</button>
+    </div>
+    <div class="tb-group">
+      <button class="btn icon" id="btnUndo" title="Rückgängig (Strg+Z)">↶</button>
+      <button class="btn icon" id="btnRedo" title="Wiederholen (Strg+Y)">↷</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="tb-group grid-ctl">
+      <label class="switch" title="Bauteile am Raster einrasten lassen">
+        <input type="checkbox" id="snapOn" checked><span class="slider"></span><span class="sw-label">Einrasten</span>
+      </label>
+      <label class="grid-size" title="Rasterabstand in Zentimetern">Raster
+        <input type="number" id="gridCm" min="1" max="500" step="1" value="10"> cm
+      </label>
+      <label class="switch" title="Punktraster anzeigen">
+        <input type="checkbox" id="gridShow" checked><span class="slider"></span><span class="sw-label">Punkte</span>
+      </label>
+    </div>
+    <div class="tb-group">
+      <button class="btn icon" id="zoomOut" title="Verkleinern">−</button>
+      <span class="zoom-val" id="zoomVal">100 %</span>
+      <button class="btn icon" id="zoomIn" title="Vergrößern">+</button>
+      <button class="btn" id="zoomFit" title="Alles einpassen">Einpassen</button>
+    </div>
+    <button class="status-pill" id="statusPill" title="Analyse anzeigen"></button>
+  </header>
+
+  <div class="workspace">
+    <!-- Bibliothek -->
+    <aside class="library">
+      <button class="btn primary auto-build" id="btnAutoBuild" title="Aus den vorhandenen Bauteilen eine fertige, verdrahtete Anlage bauen – fehlende Regler, Wechselrichter, Kabel und Sicherungen werden ergänzt">✨ Autom. Fertigstellen</button>
+      <div class="lib-head">
+        <input type="search" id="libSearch" placeholder="Bauteil suchen …">
+        <button class="btn small primary" id="btnNewProduct" title="Eigenes Bauteil anlegen">+ Eigenes</button>
+      </div>
+      <p class="lib-hint">Bauteile auf die Fläche ziehen (oder doppelklicken).</p>
+      <div class="lib-list" id="libList"></div>
+      <button class="btn small ghost lib-restore" id="btnRestore" title="Gelöschte Standard-Bauteile wieder hinzufügen">Standard-Bauteile wiederherstellen</button>
+    </aside>
+
+    <!-- Baukasten-Fläche -->
+    <main class="board" id="board">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg" tabindex="0">
+        <defs>
+          <pattern id="dots" patternUnits="userSpaceOnUse" width="10" height="10">
+            <circle id="dot" cx="0" cy="0" r="0.6"></circle>
+          </pattern>
+        </defs>
+        <g id="world">
+          <g id="planLayer"></g>
+          <rect id="gridRect" x="-100000" y="-100000" width="200000" height="200000" fill="url(#dots)"></rect>
+          <g id="wireLayer"></g>
+          <g id="instLayer"></g>
+          <g id="tempLayer"></g>
+        </g>
+      </svg>
+      <div class="board-empty" id="boardEmpty">
+        <h2>Leere Baufläche</h2>
+        <p>Zieh Bauteile aus der Bibliothek links hierher.<br>
+          Verbinden: an einem Anschluss ziehen und auf einem anderen loslassen.</p>
+        <p class="muted">Mausrad = Zoom · Leere Fläche ziehen = verschieben · R = drehen · Entf = löschen</p>
+      </div>
+      <div class="legend">
+        <span><i class="pdot plus"></i>Plus</span><span><i class="pdot minus"></i>Minus</span><span><i class="pdot ac"></i>230 V AC</span><span><i class="pdot pass"></i>Durchgang</span>
+      </div>
+    </main>
+
+    <!-- Rechte Spalte -->
+    <aside class="side">
+      <nav class="tabs">
+        <button data-tab="props" class="active">Eigenschaften</button>
+        <button data-tab="analysis">Analyse <span class="tab-badge" id="tabBadge" hidden></span></button>
+        <button data-tab="project">Projekt</button>
+      </nav>
+      <section class="tab" id="tab-props"></section>
+      <section class="tab" id="tab-analysis" hidden></section>
+      <section class="tab" id="tab-project" hidden>
+        <div class="p-sec">Bauplan im Hintergrund</div>
+        <div class="row">
+          <label class="btn small file-btn">📐 Bauplan laden (PDF/PNG/JPG)<input type="file" id="planFile" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"></label>
+        </div>
+        <div id="planBox" hidden>
+          <p class="muted small" id="planInfo"></p>
+          <div class="fields2">
+            <label>Maßstab 1 :<input type="number" id="planScale" min="1" max="100000" step="1" placeholder="z. B. 100"></label>
+            <label>PDF-Seite<input type="number" id="planPage" min="1" step="1"></label>
+          </div>
+          <p class="muted small" id="planScaleHint"></p>
+          <div class="row">
+            <button class="btn small" type="button" id="planCalib" title="Zwei Punkte auf dem Plan anklicken, deren Abstand bekannt ist (z. B. eine bemaßte Wand), dann die echte Länge eingeben">📏 Maßstab über 2 Punkte</button>
+          </div>
+          <label>Deckkraft<input type="range" id="planOpacity" min="0.05" max="1" step="0.05"></label>
+          <label class="check"><input type="checkbox" id="planLocked"> Plan sperren (nicht verschiebbar)</label>
+          <label class="check"><input type="checkbox" id="planHidden"> Plan ausblenden</label>
+          <div class="row"><button class="btn small danger" type="button" id="planRemove">Bauplan entfernen</button></div>
+        </div>
+        <div class="p-sec">Standort &amp; Annahmen</div>
+        <label>PLZ des Standorts<input type="text" id="setPlz" maxlength="5" inputmode="numeric" placeholder="z. B. 30159"></label>
+        <label>Koordinaten (Breite, Länge)<span class="row-inline"><input type="text" id="setCoords" placeholder="z. B. 50.1109, 8.6821" autocomplete="off"><button class="btn small" type="button" id="btnGeo" title="Aktuellen Standort übernehmen (der Browser fragt dafür einen Ortungsdienst im Internet an)">📍</button></span></label>
+        <p class="muted small">Für die Neigungsempfehlung und Tageslängen. Aus Google Maps: Rechtsklick auf den Ort → Koordinaten anklicken und hier einfügen.</p>
+        <p class="muted small" id="setRegion"></p>
+        <label>Eigener Jahresertrag (optional)<input type="number" id="setYield" min="300" max="2000" step="10" placeholder="kWh pro kWp und Jahr"></label>
+        <p class="muted small">Überschreibt den Wert aus der Postleitzahl, z. B. mit einem Wert aus PVGIS.</p>
+        <label>Tiefste Temperatur am Standort<input type="number" id="setTmin" min="-40" max="20" step="1"></label>
+        <p class="muted small">Bestimmt die maximale Modulspannung (bei Kälte steigt die Leerlaufspannung). Deutschland: −10 °C, Gebirge: −20 °C.</p>
+        <label>Gewünschte Autonomie (Inselanlagen)<input type="number" id="setAutonomy" min="0.5" max="14" step="0.5"></label>
+        <p class="muted small">So viele Tage ohne Sonne soll die Batterie überbrücken.</p>
+        <label>Notizen<textarea id="setNotes" rows="5"></textarea></label>
+        <div class="row">
+          <button class="btn" id="btnExport">Als Datei exportieren</button>
+          <label class="btn file-btn">Datei importieren<input type="file" id="fileImport" accept=".json,application/json"></label>
+        </div>
+        <p class="muted small disclaimer">Planungshilfe mit Näherungswerten – ersetzt keine Prüfung durch eine Elektrofachkraft (u. a. VDE 0100-712 für PV-Anlagen, VDE-AR-N 4105 für Netzanschluss).</p>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Bauteil-Editor -->
+  <div class="modal" id="productModal" hidden>
+    <div class="modal-box">
+      <div class="modal-head"><h2 id="pmTitle">Bauteil</h2><button class="btn ghost icon" data-close>✕</button></div>
+      <form id="pmForm" class="pm-form" autocomplete="off"></form>
+      <div class="modal-foot">
+        <button class="btn danger" id="pmDelete">Löschen</button>
+        <div class="spacer"></div>
+        <button class="btn" data-close>Abbrechen</button>
+        <button class="btn primary" id="pmSave">Speichern</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Öffnen -->
+  <div class="modal" id="openModal" hidden>
+    <div class="modal-box">
+      <div class="modal-head"><h2>Gespeicherte Systeme</h2><button class="btn ghost icon" data-close>✕</button></div>
+      <div id="openList" class="open-list"></div>
+    </div>
+  </div>
+
+  <!-- Bericht Autom. Fertigstellen -->
+  <div class="modal" id="buildModal" hidden>
+    <div class="modal-box">
+      <div class="modal-head"><h2>Autom. Fertigstellen – Ergebnis</h2><button class="btn ghost icon" data-close>✕</button></div>
+      <div class="build-body" id="buildBody"></div>
+      <div class="modal-foot"><span class="muted small">Rückgängig: Strg+Z</span><div class="spacer"></div><button class="btn" id="buildToAnalysis">Zur Analyse</button><button class="btn primary" data-close>Schließen</button></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="js/catalog.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/autobuild.js"></script>
+  <script src="js/app.js"></script>
+  <div id="printView" class="print-view" aria-hidden="true"></div>
+</body>
+</html>

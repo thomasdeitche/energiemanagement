@@ -1,0 +1,54 @@
+name: Release
+
+# Baut ein eigenständig lauffähiges Portable-Paket (inkl. aktueller Node.js-LTS-Version) und
+# veröffentlicht es als GitHub Release. Läuft bei jedem Versions-Tag (z. B. v1.0.1) oder manuell.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      - name: Aktuelle Node.js-LTS-Version ermitteln
+        id: nodever
+        shell: pwsh
+        run: |
+          $index = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json"
+          $latest = $index | Where-Object { $_.lts } | Select-Object -First 1
+          "version=$($latest.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Node.js herunterladen und node.exe entpacken
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.nodever.outputs.version }}"
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/node-$ver-win-x64.zip" -OutFile node.zip
+          Expand-Archive -Path node.zip -DestinationPath node_extracted
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          Copy-Item "node_extracted/node-$ver-win-x64/node.exe" -Destination "runtime/node.exe"
+
+      - name: Release-Paket zusammenstellen
+        shell: pwsh
+        run: |
+          $dest = "package/Energiemanagement"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item -Recurse -Path public, runtime -Destination $dest
+          Copy-Item -Path server.js, start.bat, README.md, energiemanagement.ico -Destination $dest
+          Compress-Archive -Path $dest -DestinationPath "Energiemanagement-portable.zip"
+
+      - name: Release veröffentlichen
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Energiemanagement-portable.zip
+          generate_release_notes: true
+          body: |
+            Portables Paket inkl. Node.js ${{ steps.nodever.outputs.version }} (LTS) – kein separates
+            Node.js nötig. ZIP entpacken und `start.bat` doppelklicken.

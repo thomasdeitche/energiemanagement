@@ -136,6 +136,20 @@
       ports: () => [P('+', '+', 'r', 0.66, 'dc', '+', 'bat'), P('-', '−', 'r', 0.86, 'dc', '-', 'bat')],
       spec: (p) => `${p.vdc} V · ${fmt(p.maxA)} A`,
     },
+    dcconv: {
+      label: 'DC-Spannungswandler', cat: 'Laderegler & Wandler', icon: '🔀', color: '#4a90a4', w: 64, h: 50,
+      fields: [
+        { id: 'vIn', label: 'Eingangsspannung (Batterie)', type: 'select', def: '48', options: VOLTS, required: true },
+        { id: 'vOut', label: 'Ausgangsspannung (Verbraucher)', type: 'select', def: '12', options: VOLTS, required: true },
+        { id: 'maxW', label: 'max. Ausgangsleistung', type: 'number', unit: 'W', def: 120, required: true },
+        { id: 'eta', label: 'Wirkungsgrad', type: 'number', unit: '%', def: 90, min: 50, max: 100 },
+      ],
+      ports: () => [
+        P('bat+', 'B+', 'l', 0.58, 'dc', '+', 'bat'), P('bat-', 'B−', 'l', 0.85, 'dc', '-', 'bat'),
+        P('out+', 'Aus+', 'r', 0.58, 'dc', '+', 'bat'), P('out-', 'Aus−', 'r', 0.85, 'dc', '-', 'bat'),
+      ],
+      spec: (p) => `${p.vIn} V → ${p.vOut} V · ${fmt(p.maxW)} W`,
+    },
     charger: {
       label: 'Batterie-Ladegerät (230 V)', cat: 'Laderegler & Wandler', icon: '🔋', color: '#6b8fd6', w: 60, h: 50,
       fields: [
@@ -478,6 +492,8 @@
     L('mppt', 'MPPT-Laderegler 150 V / 100 A (Beispiel)', { ctype: 'mppt', maxVoc: 150, maxA: 100, maxIsc: 70, volts: '12/24/48', eta: 98, price: 800 }),
     L('mppt', 'MPPT-Laderegler 250 V / 60 A (Beispiel)', { ctype: 'mppt', maxVoc: 250, maxA: 60, maxIsc: 35, volts: '12/24/48', eta: 98, price: 600 }),
     L('inverter', 'Wechselrichter 24 V / 5000 W Sinus (Beispiel)', { vdc: '24', pCont: 5000, pPeak: 10000, eta: 93, idle: 30, wave: 'sinus', price: 1100 }),
+    L('dcconv', 'DC-Spannungswandler 48 V → 12 V / 180 W (Beispiel)', { vIn: '48', vOut: '12', maxW: 180, eta: 90, price: 60 }),
+    L('dcconv', 'DC-Spannungswandler 24 V → 12 V / 180 W (Beispiel)', { vIn: '24', vOut: '12', maxW: 180, eta: 91, price: 45 }),
   ];
 
   return {

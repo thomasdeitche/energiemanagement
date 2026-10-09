@@ -20,7 +20,7 @@
     const settings = Object.assign({ tMin: -10, tCell: 70 }, project.settings || {});
     const prodOf = (i) => lib[i.productId] || i.product;
     const notes = [];
-    const note = (sev, title, text, why, fix) => notes.push({ sev, title, text: text || '', why: why || [], fix: fix || [], refs: [] });
+    const note = (sev, title, text, why, fix) => notes.push({ sev, title, text: text || '', why: why || [], fix: fix || [], refs: [], auto: null, choices: [] });
     const added = [];
     const changed = [];
 
@@ -372,7 +372,9 @@
     }
 
     // ---------- Aufbau ----------
-    let invInst = null, fields = [], microInsts = [];
+    let invInst = null, fields = [], microInsts = [], batInvInst = null;
+    const microGroups = []; // { mi, mods } – Module je Mikro-Wechselrichter, für die Anordnung zusammen platziert
+    const dcConvOf = new Map(); // Last-ID → DC-Spannungswandler-Instanz, für die Anordnung
     if (!grid) {
       if (!bats.length) {
         note('error', 'Batterie fehlt', 'Ohne Hausnetz braucht eine Solaranlage einen Speicher.',
@@ -410,6 +412,7 @@
       // Netzbetrieb
       use(grid);
       for (const l of acLoads) W(grid, 'ac', l, 'ac', CAB.ac);
+      let storageWired = false;
       if (bats.length) {
         const hy = libOf('hybrid');
         bank = buildBank(48, true);
@@ -419,7 +422,7 @@
           if (H && pvs.length) {
             const m = majority(pvs);
             const M = lib[m.pid];
-            const L = layoutsFor(M, m.use.length).filter((x) => x.vocCold <= num(H.maxVoc, 500) && x.vmp >= num(H.mpptMin, 0)).pop();
+            const L = layoutsFor(M, m.use.length).filter((x) => x.vocCold <= num(H.maxVoc, 500) && x.vmp >= num(H.mpptMin, 0) && x.isc <= num(H.maxIsc, Infinity)).pop();
             if (L) {
               const hInst = newInst(H, 'Hybrid-Wechselrichter: Solar + Batterie + Netz (DC-gekoppelt)');
               const strings = [];
@@ -436,16 +439,48 @@
               note('info', `Solarfeld: ${m.use.length} × ${short(M.name)} → ${L.s}S${L.p}P am ${short(H.name)}`, `${fmt(L.P)} Wp, MPP-Spannung ${fmt(L.vmp)} V (Bereich ab ${fmt(H.mpptMin)} V), Leerlauf bei Kälte ${fmt(L.vocCold)} V (max. ${fmt(H.maxVoc)} V).`,
                 ['Hybrid-Wechselrichter brauchen hohe Strangspannungen – deshalb möglichst viele Module in Reihe, aber unter der maximalen Eingangsspannung.', 'DC-Kopplung: Solarstrom lädt die Batterie ohne Umweg über Wechselstrom.'], []);
               built = true;
+              storageWired = true;
             } else note('warn', 'Module passen nicht zum Hybrid-Wechselrichter', `${m.use.length} × ${short(M.name)} erreichen nicht den MPP-Bereich ab ${fmt(H.mpptMin)} V.`,
               ['Hybrid-Wechselrichter sind Hochvolt-Geräte: Sie brauchen lange Modulstränge (oft 6–10 Module in Reihe).'], ['Mehr Module verwenden – oder Mikro-Wechselrichter + Batterie-Wechselrichter (AC-Kopplung).']);
           }
           if (!built) {
             const BI = libOf('batinv').find((b) => Math.abs(num(b.batV, 48) - bank.v) / num(b.batV, 48) <= 0.15);
             if (BI) {
-              const bi = newInst(BI, 'Batterie-Wechselrichter: Speicher am Hausnetz (AC-gekoppelt)');
-              W(bank.plus, '+', bi, 'bat+', CAB.dc); W(bank.minus, '-', bi, 'bat-', CAB.dc); W(bi, 'ac', grid, 'ac', CAB.ac);
+              batInvInst = newInst(BI, 'Batterie-Wechselrichter: Speicher am Hausnetz (AC-gekoppelt)');
+              W(bank.plus, '+', batInvInst, 'bat+', CAB.dc); W(bank.minus, '-', batInvInst, 'bat-', CAB.dc); W(batInvInst, 'ac', grid, 'ac', CAB.ac);
+              storageWired = true;
             } else note('warn', `Kein Speicher-Wechselrichter für ${bank.v} V`, 'Die Batterien können nicht ans Hausnetz angebunden werden.',
               ['Am Hausnetz braucht ein Speicher einen Hybrid- oder Batterie-Wechselrichter mit passender Batteriespannung (meist 48 V).'], ['Batterien auf 48 V verschalten (mehr Batterien in Reihe) oder passenden Wechselrichter anlegen.']);
+          }
+          // Gleichstrom-Verbraucher (z. B. 12-V-USB-Lader) direkt an die Batteriebank, sobald die ans Hausnetz
+          // angebunden ist – unabhängig von AC-Kopplung (Hybrid) oder DC-Kopplung (Batterie-Wechselrichter).
+          if (storageWired) {
+            for (const l of dcLoads) {
+              const v = Number(prodOf(l).vdc);
+              if (v === bank.v) { W(bank.plus, '+', l, '+', CAB.dc); W(bank.minus, '-', l, '-', CAB.dc); continue; }
+              // Spannung passt nicht direkt: passenden DC-Spannungswandler suchen (eigenes Teil bevorzugt) oder anlegen.
+              const P = num(prodOf(l).p, 0);
+              const fits = (c) => Number(c.vIn) === bank.v && Number(c.vOut) === v && num(c.maxW, 0) >= P;
+              const userConv = of('dcconv').find((i) => unused.has(i.id) && fits(prodOf(i)));
+              let convInst = userConv || null;
+              if (!convInst) {
+                const best = libOf('dcconv').filter(fits).sort((a, b) => num(a.price, 1e9) - num(b.price, 1e9))[0];
+                if (best) convInst = newInst(best, `DC-Spannungswandler für ${short(prodOf(l).name)} (${bank.v} V → ${v} V)`);
+              }
+              if (convInst) {
+                use(convInst);
+                dcConvOf.set(l.id, convInst);
+                W(bank.plus, '+', convInst, 'bat+', CAB.dc); W(bank.minus, '-', convInst, 'bat-', CAB.dc);
+                W(convInst, 'out+', l, '+', CAB.dc); W(convInst, 'out-', l, '-', CAB.dc);
+                note('info', `DC-Spannungswandler: ${short(prodOf(convInst).name)}`,
+                  `Versorgt ${short(prodOf(l).name)} (${v} V, ${fmt(P)} W) aus der ${bank.v}-V-Batteriebank.`,
+                  ['Direkter Anschluss würde das Gerät durch die falsche Spannung zerstören – der Wandler setzt die Batteriespannung auf die Gerätespannung um.'], []);
+                continue;
+              }
+              note('warn', `${short(prodOf(l).name)}: ${v} V passt nicht`, `Das Gerät braucht ${v} V, die Batteriebank hat ${bank.v} V.`,
+                ['Falsche Spannung zerstört das Gerät.'],
+                [`Gerät für ${bank.v} V wählen`, `DC-Spannungswandler (${bank.v} V → ${v} V, ≥ ${fmt(P)} W) als eigenes Bauteil anlegen`, 'oder Gerät als 230-V-Verbraucher modellieren.']);
+            }
           }
         }
         if (built) pvs.forEach(use);
@@ -457,26 +492,30 @@
         const vocC = num(M.voc, 0) * (1 + num(M.tkVoc, -0.3) / 100 * (settings.tMin - 25));
         // günstigste Gesamtlösung für genau diese Modulanzahl
         const costOf = (p) => Math.ceil(freePv.length / Number(p.inputs || 1)) * num(p.price, 1e6);
-        const micro = libOf('micro').filter((p) => num(p.maxInV, 60) >= vocC).sort((a, b) => costOf(a) - costOf(b) || num(a.pAc, 0) - num(b.pAc, 0))[0];
+        const micro = libOf('micro').filter((p) => num(p.maxInV, 60) >= vocC && (!settings.simplifiedReg || num(p.pAc, 0) <= 800)).sort((a, b) => costOf(a) - costOf(b) || num(a.pAc, 0) - num(b.pAc, 0))[0];
         if (!micro) note('error', 'Kein passender Mikro-Wechselrichter', `Die Leerlaufspannung der Module (${fmt(vocC)} V bei Kälte) passt zu keinem Mikro-Wechselrichter der Bibliothek.`, ['Mikro-Wechselrichter haben meist max. 60 V Eingangsspannung.'], ['Passenden Mikro-Wechselrichter anlegen.']);
         else {
           const nIn = Number(micro.inputs || 1);
           for (let k = 0; k < freePv.length; k += nIn) {
             const mi = newInst(micro, 'Netz-Wechselrichter: je Modul ein Eingang');
             microInsts.push(mi);
-            freePv.slice(k, k + nIn).forEach((pv, idx) => { W(pv, '+', mi, `pv${idx + 1}+`, CAB.pv); W(pv, '-', mi, `pv${idx + 1}-`, CAB.pv); use(pv); });
+            const mods = freePv.slice(k, k + nIn);
+            microGroups.push({ mi, mods });
+            mods.forEach((pv, idx) => { W(pv, '+', mi, `pv${idx + 1}+`, CAB.pv); W(pv, '-', mi, `pv${idx + 1}-`, CAB.pv); use(pv); });
             W(mi, 'ac', grid, 'ac', CAB.ac);
           }
         }
       }
-      if (dcLoads.length) note('info', 'DC-Verbraucher nicht eingebunden', 'Am Hausnetz werden 230-V-Geräte versorgt; DC-Verbraucher brauchen eine Batterie/Netzteil.', [], []);
+      if (dcLoads.length && !storageWired) note('info', 'DC-Verbraucher nicht eingebunden', 'Am Hausnetz werden 230-V-Geräte versorgt; DC-Verbraucher brauchen eine Batterie mit Speicher-Wechselrichter.', [], []);
     }
     for (const id of unused) {
       const i = insts.find((x) => x.id === id);
       note('info', `${short(prodOf(i).name)} nicht verwendet`, 'Für dieses Bauteil gab es im Aufbau keinen passenden Platz.', [], ['Bei Bedarf von Hand verbinden.']);
     }
 
-    // ---------- Anordnen (links → rechts: Solar, Regler, Batterie, Wechselrichter, Verbraucher) ----------
+    // ---------- Anordnen (links → rechts: Solar, Regler, Batterie, Wechselrichter, Netz/Verbraucher) ----------
+    // Jede Gruppe bekommt eine eigene Spalte (x-Bereich) und eigene Zeilen (y-Bereich), die sich nicht
+    // überschneiden – so bleiben alle Leitungen kurz und direkt zwischen benachbarten Bauteilen nachvollziehbar.
     let x = 0;
     let maxY = 0;
     let y0 = 0;
@@ -494,15 +533,34 @@
     if (bank) {
       bank.strings.forEach((s, j) => s.list.forEach((b, k) => pos(b, x + k * 80, j * 60)));
       x += bank.s * 80 + 150;
+      maxY = Math.max(maxY, bank.p * 60);
     }
     const others = insts.filter((i) => ['charger', 'dcdc', 'wind', 'shore', 'generator'].includes(prodOf(i).type) && !unused.has(i.id));
     others.forEach((o, k) => pos(o, x - 230 + (prodOf(o).type === 'shore' || prodOf(o).type === 'generator' ? -110 : 0), (bank ? bank.p * 60 : 0) + 60 + k * 60));
-    if (invInst) { pos(invInst, x, 0); x += 160; }
-    for (const mi of microInsts) { pos(mi, x, microInsts.indexOf(mi) * 120); }
-    if (microInsts.length) x += 140;
+    maxY = Math.max(maxY, (bank ? bank.p * 60 : 0) + 60 + others.length * 60);
+    // Wechselrichter am Hausnetz: entweder Insel-Wechselrichter (ohne Netz) oder Batterie-Wechselrichter (AC-gekoppelt) – nie beide zugleich.
+    const mainInv = invInst || batInvInst;
+    if (mainInv) { pos(mainInv, x, 0); x += 160; }
+    // Mikro-Wechselrichter: jeweils mit den eigenen Modulen als kompakte Gruppe, damit die kurzen PV-Leitungen sichtbar bleiben.
+    microGroups.forEach((grp, idx) => {
+      const rowY = idx * 130;
+      grp.mods.forEach((m, k) => pos(m, x + k * 115, rowY));
+      pos(grp.mi, x + grp.mods.length * 115 + 30, rowY);
+      maxY = Math.max(maxY, rowY + 100);
+    });
+    if (microGroups.length) x += Math.max(...microGroups.map((g) => g.mods.length)) * 115 + 30 + 140;
     if (grid) { pos(grid, x, 0); x += 130; }
     acLoads.forEach((l, k) => pos(l, x, k * 55));
-    dcLoads.forEach((l, k) => pos(l, (bank ? bank.plus.x : x), (bank ? bank.p * 60 : 0) + 60 + (others.length + k) * 60));
+    maxY = Math.max(maxY, acLoads.length * 55);
+    // DC-Verbraucher: direkt an der Batteriebank, oder – falls die Spannung nicht passt – über den DC-Spannungswandler davor.
+    const dcRowY0 = (bank ? bank.p * 60 : 0) + 60 + others.length * 60;
+    dcLoads.forEach((l, k) => {
+      const rowY = dcRowY0 + k * 60;
+      const baseX = bank ? bank.plus.x : x;
+      const conv = dcConvOf.get(l.id);
+      if (conv) { pos(conv, baseX + 90, rowY); pos(l, baseX + 190, rowY); } else pos(l, baseX, rowY);
+    });
+    maxY = Math.max(maxY, dcRowY0 + dcLoads.length * 60);
     // unbenutzte Teile unten ablegen
     let ux = 0;
     for (const id of unused) { const i = insts.find((q) => q.id === id); pos(i, ux, Math.max(maxY, 300) + 120); ux += 120; }
@@ -518,7 +576,7 @@
   // bewertet mit derselben Prüfung (engine.analyze), die auch die Hinweise erzeugt. Istbestand-Batterien: nie ergänzen.
   function autoBuild(project, library) {
     const base = buildOnce(project, library);
-    if (!base.ok || !base.bank || (project.instances || []).some((i) => (library.find((p) => p.id === i.productId) || i.product || {}).type === 'grid')) return base;
+    if (!base.ok || !base.bank) return base;
     const lib = {};
     for (const p of library) lib[p.id] = p;
     const userBats = (project.instances || []).filter((i) => !i.auto && (lib[i.productId] || i.product || {}).type === 'battery');
@@ -552,7 +610,7 @@
       text: `Mit ${nUser} Batterien meldete die Prüfung: ${s0.hits.map((h) => h.title).join('; ') || 'Spannung/Verschaltung ungünstig'}.`,
       why: ['Ergänzt werden nur Batterien desselben Typs – in einer Bank dürfen keine unterschiedlichen Batterien gemischt werden.',
         'Gewählt wurde die kleinste Anzahl, bei der die Prüfung die wenigsten Probleme meldet. Grundlage sind dieselben Regeln wie bei den Hinweisen.',
-        'Soll die Bank so bleiben, wie sie ist: Batterien als „Istbestand“ markieren.'], fix: [], refs: [] });
+        'Soll die Bank so bleiben, wie sie ist: Batterien als „Istbestand“ markieren.'], fix: [], refs: [], auto: null, choices: [] });
     return res;
   }
 

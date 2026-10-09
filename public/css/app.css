@@ -111,6 +111,7 @@ label > input, label > select, label > textarea { margin-top: 3px; }
 .board { position: relative; background: var(--board); overflow: hidden; min-width: 0; }
 #canvas { width: 100%; height: 100%; display: block; outline: none; touch-action: none; user-select: none; }
 #canvas.panning { cursor: grabbing; }
+#canvas.marquee-mode { cursor: crosshair; }
 #dot { fill: var(--board-dot); }
 .board-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; pointer-events: none; color: var(--muted); }
 .board-empty h2 { color: var(--text); font-size: 20px; margin-bottom: 8px; }
@@ -122,6 +123,8 @@ label > input, label > select, label > textarea { margin-top: 3px; }
 .inst { cursor: move; }
 .inst .body { fill: #222c3b; stroke: #3e4c62; stroke-width: 0.5; }
 .inst.sel .body { stroke: var(--accent); stroke-width: 1.2; }
+.inst.multi-sel .body { stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 2; }
+.marquee { fill: var(--accent); fill-opacity: .1; stroke: var(--accent); stroke-width: .6; stroke-dasharray: 2 1.5; }
 .inst .stripe { opacity: .95; }
 .inst text { fill: var(--text); font-family: var(--font); pointer-events: none; }
 .inst .t-name { font-weight: 600; }
@@ -241,6 +244,13 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
 .auto-all { width: 100%; margin-bottom: 10px; }
 .auto-build { margin: 10px 10px 0; padding: 9px 12px; font-size: 14px; }
 .build-body { padding: 10px 16px 16px; overflow-y: auto; }
+.choice-body { padding: 14px 16px; overflow-y: auto; }
+.choice-body > .muted { margin: 0 0 10px; }
+.choice-safe { font-size: 13px; margin: 0 0 14px; padding: 8px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+.choice-safe.unsafe { border-color: var(--error); color: #ffb0a8; }
+.choice-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+.choice-item p { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+.choice-item .btn { width: 100%; text-align: left; }
 .build-list { margin: 4px 0 8px; padding-left: 18px; font-size: 13px; }
 .build-list li { margin: 3px 0; }
 .build-ok { color: var(--ok); font-weight: 600; }

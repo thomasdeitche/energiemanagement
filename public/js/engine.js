@@ -93,10 +93,12 @@
     for (const p of library || []) lib[p.id] = p;
     const settings = Object.assign({ plz: '', yieldOverride: '', tMin: -10, tCell: 70, autonomy: 2 }, project.settings || {});
     const F = [];
-    const add = (sev, title, text, why, fix, refs, auto) => {
+    // choices: mehrere gleichwertige Lösungswege zur Auswahl (statt einer einzigen Auto-Korrektur), je
+    // { label, consequence (Auswirkung, falls NICHT umgesetzt), safe (Betrieb trotzdem gefahrlos möglich?), auto }
+    const add = (sev, title, text, why, fix, refs, auto, choices) => {
       // Istbestand-Teile werden nie automatisch getauscht
       if (auto && auto.op === 'swap' && byId[auto.inst] && byId[auto.inst].bestand) auto = null;
-      const f = { sev, title, text: text || '', why: why || [], fix: fix || [], refs: refs || [], auto: auto || null };
+      const f = { sev, title, text: text || '', why: why || [], fix: fix || [], refs: refs || [], auto: auto || null, choices: choices || [] };
       F.push(f);
       return f;
     };
@@ -173,6 +175,16 @@
       for (let n = 1; n < ks.length; n++) link({ id: 'p:' + i.id + ':' + n, a: ks[0], b: ks[n], kind: i.t.passive, inst: i });
     }
     const connected = (k) => (adj.get(k) || []).some((e) => e.kind === 'wire');
+    // Andere Instanz am anderen Ende einer Kabelverbindung ab diesem Anschluss (erste gefundene).
+    const wireNeighborInst = (instId, portId) => {
+      const k = key(instId, portId);
+      for (const e of adj.get(k) || []) {
+        if (e.kind !== 'wire') continue;
+        const other = nodes.get(e.a === k ? e.b : e.a);
+        if (other) return other.inst;
+      }
+      return null;
+    };
 
     // Netze (zusammenhängende Anschlüsse)
     const netOf = new Map();
@@ -858,11 +870,15 @@
       if (d.type === 'micro') {
         const n = Number(p.inputs || 1);
         let pvTotal = 0;
+        let maxVocCold = 0;
+        let usedInputs = 0;
         for (let k = 1; k <= n; k++) {
           const g = checkPv(`pv${k}+`, `pv${k}-`, { label: `Eingang ${k}`, required: k === 1 });
           if (!g) continue;
+          usedInputs++;
           const v = g.val;
           pvTotal += v.P;
+          maxVocCold = Math.max(maxVocCold, v.vocCold);
           const maxV = num(p.maxInV, 60);
           if (v.vocCold > maxV) add('error', 'Eingangsspannung zu hoch', `${d.name} Eingang ${k}: ${fmt(v.vocCold)} V bei Kälte, max. ${fmt(maxV)} V.`,
             ['Mikro-Wechselrichter haben niedrige Eingangsspannungen (meist 60 V) – meist passt nur ein Modul je Eingang.', 'Überspannung zerstört den Wechselrichter.'],
@@ -875,16 +891,29 @@
         const pAc = num(p.pAc, 800);
         if (pvTotal) {
           const r = pvTotal / pAc;
-          ilr.push({ inst: d, pv: pvTotal, ac: pAc, r });
+          ilr.push({ inst: d, pv: pvTotal, ac: pAc, r, vocCold: maxVocCold, usedInputs });
           d.calc = { pvP: pvTotal, ratio: r };
         }
         const grid = acNeighbors(d).some((o) => o.type === 'grid');
         if (!grid) add('error', 'Netz-Wechselrichter ohne Netz', `${d.name}: Am AC-Ausgang hängt kein Hausnetz.`,
           ['Netzgekoppelte Wechselrichter synchronisieren sich auf die Netzspannung. Ohne Netz schalten sie aus Sicherheitsgründen ab (Netz- und Anlagenschutz).', 'Sie können deshalb keine Verbraucher alleine versorgen – auch nicht bei Stromausfall.'],
           ['AC-Ausgang mit dem Hausnetz verbinden', 'für Notstrom: Hybrid- oder Insel-Wechselrichter mit Batterie verwenden.'], refs);
-        if (pAc > 800) add('info', 'Mehr als 800 W Einspeiseleistung', `${d.name}: ${fmt(pAc)} W AC.`,
-          ['Die vereinfachte Anmeldung als Steckersolargerät (Balkonkraftwerk) gilt in Deutschland bis 800 VA Wechselrichterleistung.', 'Darüber ist es eine normale PV-Anlage: Anmeldung beim Netzbetreiber durch eine Elektrofachkraft.'],
-          ['Wechselrichter auf 800 W drosseln lassen oder als reguläre Anlage anmelden.'], refs);
+        if (pAc > 800) {
+          const fits800 = libOf('micro').some((c) => num(c.pAc, 0) <= 800 && num(c.maxInV, 60) >= maxVocCold);
+          const choices = fits800
+            ? [{ label: 'Auf vereinfachte Anmeldung umstellen (≤ 800 VA je Wechselrichter)', safe: true,
+                auto: { op: 'setSetting', key: 'simplifiedReg', value: true, label: 'Vereinfachte Anmeldung: Mikro-Wechselrichter auf ≤ 800 VA begrenzen und Anlage neu fertigstellen' },
+                consequence: 'Es bleibt bei der normalen Anmeldung als PV-Anlage beim Netzbetreiber (durch eine Elektrofachkraft) statt der vereinfachten Meldung als Steckersolargerät.' },
+              { label: 'Als reguläre Anlage anmelden', safe: true, auto: null,
+                consequence: 'Die vereinfachte Anmeldung als Steckersolargerät entfällt – es bleibt bei der normalen Anmeldung beim Netzbetreiber.' }]
+            : [{ label: 'Als reguläre Anlage anmelden (einzige Option)', safe: true, auto: null,
+                consequence: 'Ein Umbau auf ≤ 800 VA ist mit den Geräten in der Bibliothek nicht möglich, ohne Leistung zu verlieren – es gibt kein passendes ≤ 800-VA-Gerät für diese Modulspannung. Es bleibt bei der normalen Anmeldung beim Netzbetreiber.' }];
+          add('info', 'Mehr als 800 W Einspeiseleistung', `${d.name}: ${fmt(pAc)} W AC.`,
+            ['Die vereinfachte Anmeldung als Steckersolargerät (Balkonkraftwerk) gilt in Deutschland bis 800 VA Wechselrichterleistung.', 'Darüber ist es eine normale PV-Anlage: Anmeldung beim Netzbetreiber durch eine Elektrofachkraft.',
+              fits800 ? 'Ein Umbau auf ≤ 800 VA je Wechselrichter ist mit einem Gerät aus der Bibliothek möglich, ohne dass dabei Gesamtleistung verloren geht – es werden dann nur mehr, kleinere Wechselrichter verwendet.'
+                : 'Für diese Modulspannung gibt es in der Bibliothek kein Wechselrichter-Modell mit ≤ 800 VA – ein Umbau würde daher Leistung kosten oder ist so nicht umsetzbar.'],
+            ['Wechselrichter auf 800 W drosseln lassen oder als reguläre Anlage anmelden.'], refs, null, choices);
+        }
         if (pvTotal > 2000) add('info', 'Mehr als 2000 Wp Modulleistung', `${d.name}: ${fmt(pvTotal)} Wp.`,
           ['Für Steckersolargeräte sind in Deutschland bis 2000 Wp Modulleistung vorgesehen.'], ['Modulleistung reduzieren oder als reguläre Anlage anmelden.'], refs);
       }
@@ -903,8 +932,18 @@
             ['Hochvolt-Wechselrichter brauchen lange Strings. Unterhalb des Bereichs startet er spät oder gar nicht.'], [`Mehr Module in Reihe (mind. ${Math.ceil(num(p.mpptMin, 0) / (v.vmp / v.s))} Stück).`], refs);
           if (v.vmpHot > num(p.mpptMax, Infinity)) add('warn', 'PV-Spannung über dem MPP-Bereich', `${d.name}: Vmp ${fmt(v.vmp)} V > ${fmt(p.mpptMax)} V.`,
             ['Oberhalb des Bereichs wird abgeregelt.'], ['Ein Modul weniger in Reihe.'], refs);
-          if (v.isc > num(p.maxIsc, Infinity)) add('warn', 'PV-Strom über Eingangsgrenze', `${d.name}: Isc ${fmt(v.isc)} A > ${fmt(p.maxIsc)} A.`,
-            ['Zu hoher Eingangsstrom wird begrenzt oder kann den Eingang belasten.'], ['Weniger Stränge parallel.'], refs);
+          if (v.isc > num(p.maxIsc, Infinity)) {
+            const fest = isBestand(g.insts);
+            add('warn', 'PV-Strom über Eingangsgrenze', `${d.name}: Isc ${fmt(v.isc)} A > ${fmt(p.maxIsc)} A.`,
+              ['Zu hoher Eingangsstrom wird begrenzt oder kann den Eingang belasten.'],
+              ['Weniger Stränge parallel (mehr Module in Reihe statt parallel).', 'oder Wechselrichter mit höherem Eingangsstrom wählen.'].concat(fest ? ['Die Module sind als Istbestand markiert – die Automatik ändert ihre Verschaltung deshalb nicht.'] : []), refs, null,
+              [
+                { label: 'Anders verschalten (mehr in Reihe, weniger parallel)', safe: true, auto: fest ? null : { op: 'rebuild', label: 'Solarfeld neu verschalten (Autom. Fertigstellen)' },
+                  consequence: 'Der Eingangsstrom bleibt über der Herstellergrenze – der Wechselrichter begrenzt ihn dann selbst (Ertragsverlust) oder der Eingang wird auf Dauer überlastet.' },
+                { label: 'Wechselrichter mit höherem Eingangsstrom wählen', safe: true, auto: null,
+                  consequence: 'Die Verschaltung bleibt wie gewählt – ein Wechselrichter mit höherer Stromgrenze würde denselben Strom ohne Begrenzung aufnehmen.' },
+              ]);
+          }
           ilr.push({ inst: d, pv: v.P, ac: num(p.pAc, 5000), r: v.P / num(p.pAc, 5000) });
           d.calc = { pvP: v.P, ratio: v.P / num(p.pAc, 5000) };
         }
@@ -945,10 +984,25 @@
         const vdc = Number(p.vdc || 12);
         if (!bg && d.type !== 'load_dc') add('warn', `${d.t.label} ohne Batterie`, `${d.name}: nicht mit einer Batteriebank verbunden.`,
           ['Ladegeräte und Ladequellen brauchen eine Batterie als Ziel.'], ['Mit der Batteriebank verbinden.'], refs);
-        if (!bg && d.type === 'load_dc' && (connected(key(d.id, '+')) || connected(key(d.id, '-')))) add('warn', 'DC-Verbraucher ohne Batterie', `${d.name}: hängt nicht an einer Batteriebank.`,
-          ['DC-Verbraucher sollten an der Batterie (bzw. am Lastausgang) hängen, nicht direkt an Modulen.'], ['An die Batteriebank anschließen.'], refs);
+        // Über einen DC-Spannungswandler (eingangsseitig an einer gültigen Bank) zu hängen ist genauso gültig
+        // wie direkt an der Bank – das ist ja gerade der Zweck des Wandlers (andere Gerätespannung).
+        const viaConv = [wireNeighborInst(d.id, '+'), wireNeighborInst(d.id, '-')]
+          .some((o) => o && o.type === 'dcconv' && batGroupFor(o));
+        if (!bg && !viaConv && d.type === 'load_dc' && (connected(key(d.id, '+')) || connected(key(d.id, '-')))) add('warn', 'DC-Verbraucher ohne Batterie', `${d.name}: hängt nicht an einer Batteriebank.`,
+          ['DC-Verbraucher sollten an der Batterie (bzw. am Lastausgang, ggf. über einen DC-Spannungswandler) hängen, nicht direkt an Modulen.'], ['An die Batteriebank anschließen.'], refs);
         if (bg && sysStd && sysStd !== vdc) add('error', 'Spannung passt nicht', `${d.name}: ${vdc} V an ${fmt(sysV)} V-Bank.`,
           ['Falsche Spannung zerstört das Gerät oder lädt die Batterie falsch.'], [`Gerät für ${sysStd} V verwenden (oder DC/DC-Wandler).`], refs);
+      }
+      if (d.type === 'dcconv') {
+        const vIn = Number(p.vIn || 48), vOut = Number(p.vOut || 12);
+        if (!bg) add('warn', 'DC-Spannungswandler ohne Batterie', `${d.name}: Eingang (B+/B−) hängt an keiner Batteriebank.`,
+          ['Der Wandler braucht eingangsseitig eine Batteriebank als Quelle.'], ['Eingang (B+/B−) mit der Batteriebank verbinden.'], refs);
+        else if (sysStd && sysStd !== vIn) add('error', 'DC-Spannungswandler: Eingangsspannung passt nicht', `${d.name}: erwartet ${fmt(vIn)} V Eingang, Bank hat ${fmt(sysV)} V.`,
+          ['Falsche Eingangsspannung kann den Wandler beschädigen oder er schaltet wegen Unter-/Überspannung ab.'], [`Wandler mit ${fmt(sysStd)} V Eingang wählen.`], refs);
+        const outNb = wireNeighborInst(d.id, 'out+') || wireNeighborInst(d.id, 'out-');
+        if (outNb && outNb.type === 'load_dc' && Number(outNb.product.vdc) !== vOut) add('error', 'DC-Spannungswandler: Ausgangsspannung passt nicht',
+          `${d.name} gibt ${fmt(vOut)} V aus, ${outNb.name} braucht ${fmt(Number(outNb.product.vdc))} V.`,
+          ['Falsche Spannung zerstört das angeschlossene Gerät.'], [`Wandler mit ${fmt(Number(outNb.product.vdc))} V Ausgang wählen.`], refs);
       }
       if (d.type === 'charger' && !acNeighbors(d).some((o) => ['grid', 'shore', 'generator', 'inverter', 'hybrid'].includes(o.type))) add('info', 'Ladegerät ohne Stromquelle', `${d.name}: AC-Eingang nicht mit Landstrom, Generator oder Netz verbunden.`,
         ['Ohne 230-V-Quelle lädt das Gerät nicht.'], ['AC-Eingang mit Landstrom/Generator verbinden.'], refs);
@@ -1155,6 +1209,14 @@
 
   // ---------- Simulation einer Anlage (typischer Tag je Monat, stündlich) ----------
   function simulate(s, devs, pvs, bats, loc, settings, h) {
+    // Katalog-Wirkungsgrade sind Hersteller-Bestwerte (Datenblatt-Spitzenwert bei idealer Last), keine
+    // Praxiswerte. Reale/lastgewichtete Wirkungsgrade (z. B. CEC-gewichtet bei Wechselrichtern) liegen
+    // üblicherweise 1–3 Prozentpunkte darunter (Teillast, Temperatur, Alterung) – hier konservativ mit
+    // 3 Punkten angesetzt. Gilt für Leistungswandlung (Regler/Wechselrichter/Lader), nicht für den
+    // Batterie-Wirkungsgrad (der ist im Datenblatt meist schon ein Messwert, kein Bestwert).
+    const REAL_WORLD_DERATE = 3;
+    const realEta = (pct, fallback) => Math.max(0, num(pct, fallback) - REAL_WORLD_DERATE) / 100;
+
     const bank = bats.slice().sort((a, b) => b.val.v * b.val.ah - a.val.v * a.val.ah)[0] || null;
     const bv = bank ? bank.val : null;
     const capWh = bank ? bv.v * bv.ah : 0;
@@ -1189,7 +1251,7 @@
         const mc = monthCorr(i0.props.tilt, i0.props.dir, loc.lat);
         const wpDay = range(0, 12).map((m) => loc.annual * MONTH_SHARE[m] * mc[m] / DAYS[m] * of * g.val.P); // Wh/Tag
         kwp += g.val.P / 1000;
-        let limit = Infinity, eta = num(p.eta, 96) / 100, factor = pvLoss(g);
+        let limit = Infinity, eta = realEta(p.eta, 96), factor = pvLoss(g);
         if (d.type === 'mppt') {
           const vCh = (stdVolt(bv ? bv.v : 12) || 12) * (C.CHEM_DEFAULTS[bv ? [...bv.chem][0] : 'gel'] || C.CHEM_DEFAULTS.gel).vCharge;
           limit = ctrlA(d, 30) * vCh;
@@ -1217,14 +1279,14 @@
     const winds = devs.filter((d) => d.type === 'wind' && h.batGroupFor(d));
     const dcdcs = devs.filter((d) => d.type === 'dcdc' && h.batGroupFor(d));
     const invCap = inverters.reduce((a, d) => a + num(d.product.pCont, 0), 0) + (hybrid && !hasGrid ? num(hybrid.product.pAc, 0) : 0);
-    const invEta = inverters.length ? inverters.reduce((a, d) => a + num(d.product.eta, 92), 0) / inverters.length / 100 : hybrid ? num(hybrid.product.eta, 97) / 100 : 0.92;
+    const invEta = inverters.length ? realEta(inverters.reduce((a, d) => a + num(d.product.eta, 92), 0) / inverters.length, 92) : hybrid ? realEta(hybrid.product.eta, 97) : realEta(92, 92);
     const idleW = inverters.reduce((a, d) => a + num(d.product.idle, 0), 0) + (hybrid ? num(hybrid.product.idle, 0) : 0) + (batinv ? num(batinv.product.idle, 0) : 0);
     const acPowered = (d) => h.acNeighbors(d).some((o) => ['inverter', 'grid', 'shore', 'generator', 'hybrid', 'batinv', 'micro'].includes(o.type));
     const acLoadProfiles = acLoads.filter(acPowered).map((d) => ({ d, P: num(d.product.p, 0), prof: loadProfile(d.props.hours, d.props.window), start: num(d.product.start, 1) }));
     const dcLoadProfiles = dcLoads.map((d) => ({ d, P: num(d.product.p, 0), prof: loadProfile(d.props.hours, d.props.window) }));
     const house = gridDev ? { year: num(gridDev.props.yearKwh, 0), prof: HOUSE_PROFILE[gridDev.props.profile] || HOUSE_PROFILE.haushalt } : null;
     const chgCap = chargers.reduce((a, d) => a + num(d.product.maxA, 0) * (bv ? bv.v : 12) * 1.1, 0);
-    const chgEta = chargers.length ? num(chargers[0].product.eta, 88) / 100 : 0.88;
+    const chgEta = chargers.length ? realEta(chargers[0].product.eta, 88) : realEta(88, 88);
     const maxChgW = bank ? bv.maxChg * bv.v * 1.1 : 0;
     const maxDisW = bank ? bv.maxDis * bv.v : 0;
     const shoreHours = shore ? num(shore.props.hours, 24) : 0;
@@ -1234,6 +1296,12 @@
     for (let hh = 0; hh < 24; hh++) peakAc = Math.max(peakAc, acLoadProfiles.reduce((a, l) => a + (l.prof[hh] > 0 ? l.P : 0), 0));
     const sumAc = acLoadProfiles.reduce((a, l) => a + l.P, 0);
     const surge = acLoadProfiles.length ? Math.max(...acLoadProfiles.map((l) => l.P * l.start - l.P)) + peakAc : 0;
+
+    // Zeitfenster, in dem die Batterie bevorzugt entladen wird (Netzanlagen mit Speicher) – außerhalb davon
+    // wird Netz/Solar bevorzugt, um den Speicher für die bevorzugte Zeit zu schonen. 0–24 = immer (Standard).
+    const bpS = num(settings.battPrefStart, 0), bpE = num(settings.battPrefEnd, 24);
+    const battWindowAll = bpS === bpE || (bpS === 0 && bpE === 24);
+    const preferBattery = (hh) => battWindowAll || (bpS < bpE ? hh >= bpS && hh < bpE : hh >= bpS || hh < bpE);
 
     const months = [];
     for (let m = 0; m < 12; m++) {
@@ -1311,7 +1379,7 @@
             // DC-seitige Lasten (selten) direkt aus der Batterie bzw. Netz über Ladegerät ignoriert
             let hybAvail = hybPv;
             if (hybrid) {
-              const hEta = num(hybrid.product.eta, 97) / 100;
+              const hEta = realEta(hybrid.product.eta, 97);
               const cap = num(hybrid.product.pAc, 5000);
               const toLoad = Math.min(hybAvail * hEta, need, cap);
               need -= toLoad; hybAvail -= toLoad / hEta;
@@ -1319,21 +1387,21 @@
               const exp = Math.min(rest * hEta, cap - toLoad);
               surplusAc += exp;
               day.curtailed += Math.max(0, rest - exp / hEta);
-              if (need > 0 && bank && h.batGroupFor(hybrid)) {
+              if (need > 0 && bank && h.batGroupFor(hybrid) && preferBattery(hh)) {
                 const want = Math.min(need, cap - toLoad, num(hybrid.product.maxBatW, 5000)) / hEta;
                 const miss = discharge(want);
                 need -= (want - miss) * hEta;
               }
             }
             if (batinv && bank) {
-              const bEta = num(batinv.product.eta, 95) / 100;
+              const bEta = realEta(batinv.product.eta, 95);
               const cap = num(batinv.product.pAc, 2500);
               if (surplusAc > 0) { // AC-Kopplung: Überschuss AC → DC
                 const take = Math.min(surplusAc, cap);
                 const rest = charge(take * bEta);
                 surplusAc -= take - rest / bEta;
               }
-              if (need > 0) {
+              if (need > 0 && preferBattery(hh)) {
                 const want = Math.min(need, cap) / bEta;
                 const miss = discharge(want);
                 need -= (want - miss) * bEta;
@@ -1406,12 +1474,46 @@
       if (!refs.includes(x.inst.id)) continue;
       const r2 = x.r;
       const verdict = r2 < 0.8 ? 'warn' : r2 <= 1.3 ? 'ok' : r2 <= 1.5 ? 'info' : 'warn';
+      // Bei Mikro-Wechselrichtern (ein Gerät je Modul-Gruppe, einfache Eingangsgrenzen) lässt sich ein passendes
+      // Modell aus der Bibliothek automatisch finden. Bei Hybrid-/Netz-Wechselrichtern mit langen Modulsträngen
+      // hängt die Kompatibilität zusätzlich von der Strangspannung ab – das sicher zu automatisieren ist riskant,
+      // deshalb bleibt es dort bei der manuellen Empfehlung.
+      const microSwap = () => {
+        if (x.inst.type !== 'micro') return null;
+        const minAc = x.pv / 1.3;
+        const fitsVoltage = (c) => num(c.maxInV, 60) >= x.vocCold;
+        const cands = library.filter((c) => c.type === 'micro' && c.id !== x.inst.product.id && fitsVoltage(c));
+        // 1. Versuch: ein einzelnes Gerät mit genug Eingängen für alle vorhandenen Module.
+        const direct = cands.filter((c) => Number(c.inputs || 1) >= x.usedInputs && num(c.pAc, 0) >= minAc)
+          .sort((a, b) => num(a.pAc, 0) - num(b.pAc, 0) || num(a.price, 1e9) - num(b.price, 1e9))[0];
+        if (direct) return { op: 'swap', inst: x.inst.id, spec: { productId: direct.id, name: direct.name }, label: `Wechselrichter durch „${direct.name}" ersetzen` };
+        // 2. Versuch: kein einzelnes Gerät hat genug Eingänge – mehrere kleinere Geräte, die zusammen alle Module aufnehmen
+        // (Module werden dabei gleichmäßig auf die Geräte verteilt; je Gerät ergibt das wieder ein gutes Verhältnis).
+        const pvPerInput = x.pv / x.usedInputs;
+        const split = cands.filter((c) => Number(c.inputs || 1) < x.usedInputs && num(c.pAc, 0) >= Number(c.inputs || 1) * pvPerInput / 1.3)
+          .map((c) => ({ c, n: Math.ceil(x.usedInputs / Number(c.inputs || 1)) }))
+          .filter(({ n }) => n >= 2 && n <= 20)
+          .sort((a, b) => num(a.c.price, 1e9) * a.n - num(b.c.price, 1e9) * b.n)[0];
+        return split ? { op: 'splitMicro', inst: x.inst.id, spec: { productId: split.c.id, name: split.c.name }, label: `${split.n} × „${split.c.name}" statt einem großen Gerät verwenden` } : null;
+      };
+      const choices = [];
+      if (r2 < 0.8) {
+        choices.push({ label: 'Mehr Module anschließen', safe: true, auto: modulesAuto(r, x.ac * 1.1 / 1000),
+          consequence: 'Der Wechselrichter bleibt für die vorhandene Modulleistung überdimensioniert – teurer als nötig und im Teillastbereich mit etwas schlechterem Wirkungsgrad.' });
+        choices.push({ label: 'Kleineren Wechselrichter wählen', safe: true, auto: microSwap(),
+          consequence: 'Die Modulleistung bleibt im Verhältnis zum Wechselrichter klein – ein passenderer, günstigerer Wechselrichter würde dieselbe Leistung liefern.' });
+      } else if (r2 > 1.5) {
+        choices.push({ label: 'Größeren Wechselrichter wählen', safe: true, auto: microSwap(),
+          consequence: 'An sonnigen Tagen bleibt die Abregelung (Clipping) bestehen – der Mehrertrag der Module wird dann nicht vollständig genutzt.' });
+        choices.push({ label: 'Module auf einen zweiten Wechselrichter verteilen', safe: true, auto: null,
+          consequence: 'Die Abregelung bleibt bei nur einem Wechselrichter bestehen; ein zweites Gerät würde den Überschuss zusätzlich nutzen können.' });
+      }
       add(verdict, `DC/AC-Verhältnis ${fmt(r2, 2)} – ${x.inst.name}`,
         `${fmt(x.pv)} Wp Modulleistung zu ${fmt(x.ac)} W Wechselrichter-Ausgangsleistung (auch Inverter Loading Ratio / Kapazitätsverhältnis genannt).`,
         ['Das DC/AC-Verhältnis beschreibt, wie viel Solarleistung (DC) auf die maximale Ausgangsleistung (AC) des Wechselrichters trifft. Kapazitätsverhältnis meint dasselbe: Modulleistung ÷ Wechselrichter-Nennleistung.',
           'Module erreichen ihre Nennleistung in Deutschland nur selten (Wärme, Einstrahlungswinkel). Deshalb ist ein Verhältnis von 1,1–1,3 meist wirtschaftlich optimal: Der Wechselrichter läuft öfter im effizienten Bereich, und nur wenige Spitzenstunden werden abgeregelt.',
           r2 < 0.8 ? 'Unter 0,8 ist der Wechselrichter überdimensioniert: teurer als nötig und im Teillastbereich mit schlechterem Wirkungsgrad.' : r2 > 1.5 ? 'Über 1,5 wird an sonnigen Tagen viel Energie abgeregelt (Clipping).' : r2 > 1.3 ? 'Zwischen 1,3 und 1,5 wird an Spitzentagen spürbar abgeregelt – bei Ost/West-Dächern oder Balkonen (nie volle Einstrahlung) aber oft noch sinnvoll.' : 'Der Wert liegt im empfohlenen Bereich.'],
-        r2 < 0.8 ? ['Mehr Module anschließen oder kleineren Wechselrichter wählen.'] : r2 > 1.5 ? ['Größeren Wechselrichter wählen oder Module auf einen zweiten Wechselrichter verteilen.'] : [], [x.inst.id]);
+        r2 < 0.8 ? ['Mehr Module anschließen oder kleineren Wechselrichter wählen.'] : r2 > 1.5 ? ['Größeren Wechselrichter wählen oder Module auf einen zweiten Wechselrichter verteilen.'] : [], [x.inst.id], null, choices);
     }
     for (const s of r.pvSrc) if (s.d.type === 'mppt' && s.d.calc) {
       const c = s.d.calc;
@@ -1552,10 +1654,20 @@
         r.selfConsumption !== null && r.selfConsumption < 0.4 && !r.bank ? ['Großverbraucher (Waschmaschine, Spülmaschine) mittags laufen lassen', 'Speicher prüfen, wenn abends viel verbraucht wird.'] : [], refs);
       if (r.bank) {
         const ratio = r.usableWh / 1000 / r.kwp;
+        const choices = [];
+        if (ratio > 2) {
+          choices.push({ label: 'PV-Leistung erhöhen', safe: true, auto: modulesAuto(r, r.usableWh / 1000 / 2),
+            consequence: 'Der Speicher bleibt größer als nötig – vor allem im Winter wird er nie richtig voll ausgenutzt, das Geld für die zusätzliche Kapazität rechnet sich schlechter.' });
+          choices.push({ label: 'Speicher kleiner wählen', safe: true, auto: null,
+            consequence: 'Die PV-Leistung bleibt im Verhältnis zum Speicher klein – mehr Module würden mehr vom erzeugten Strom auch wirklich nutzbar machen.' });
+        } else if (ratio < 0.5) {
+          choices.push({ label: 'Speicher vergrößern', safe: true, auto: isBestand(r.bank.insts) ? null : REBUILD_BANK,
+            consequence: 'Abends/nachts reicht der Speicher nicht so weit – es wird mehr Netzstrom bezogen, als bei größerem Speicher nötig wäre.' });
+        }
         add(ratio < 0.5 || ratio > 2 ? 'tip' : 'ok', `Speicherverhältnis ${fmt(ratio, 2)} kWh nutzbar je kWp`,
           `${fmt(r.usableWh / 1000, 1)} kWh nutzbarer Speicher zu ${fmt(r.kwp, 2)} kWp.`,
           ['Faustregel für Hausanlagen: ca. 1–1,5 kWh nutzbare Speicherkapazität je kWp – bzw. so viel, wie abends und nachts verbraucht wird.', 'Ein zu großer Speicher wird im Winter nie voll und rechnet sich schlechter; ein zu kleiner ist im Sommer schon mittags voll.'],
-          ratio > 2 ? ['Speicher kleiner wählen oder PV-Leistung erhöhen.'] : ratio < 0.5 ? ['Speicher vergrößern, falls abends viel verbraucht wird.'] : [], refs);
+          ratio > 2 ? ['Speicher kleiner wählen oder PV-Leistung erhöhen.'] : ratio < 0.5 ? ['Speicher vergrößern, falls abends viel verbraucht wird.'] : [], refs, null, choices);
       }
     }
   }

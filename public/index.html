@@ -23,6 +23,11 @@
       <button class="btn icon" id="btnUndo" title="Rückgängig (Strg+Z)">↶</button>
       <button class="btn icon" id="btnRedo" title="Wiederholen (Strg+Y)">↷</button>
     </div>
+    <div class="tb-group">
+      <label class="switch" title="Bei aktivem Schalter: Rechteck auf leerer Fläche aufziehen markiert mehrere Elemente auf einmal (Entf löscht sie gemeinsam). Einzelne Bauteile lassen sich weiterhin normal anklicken und verschieben.">
+        <input type="checkbox" id="marqueeToggle"><span class="slider"></span><span class="sw-label">Mehrfachauswahl</span>
+      </label>
+    </div>
     <div class="spacer"></div>
     <div class="tb-group grid-ctl">
       <label class="switch" title="Bauteile am Raster einrasten lassen">
@@ -124,6 +129,13 @@
         <p class="muted small">Bestimmt die maximale Modulspannung (bei Kälte steigt die Leerlaufspannung). Deutschland: −10 °C, Gebirge: −20 °C.</p>
         <label>Gewünschte Autonomie (Inselanlagen)<input type="number" id="setAutonomy" min="0.5" max="14" step="0.5"></label>
         <p class="muted small">So viele Tage ohne Sonne soll die Batterie überbrücken.</p>
+        <label>Batterie bevorzugt nutzen von<span class="row-inline">
+          <input type="number" id="setBattPrefStart" min="0" max="24" step="1"> Uhr bis
+          <input type="number" id="setBattPrefEnd" min="0" max="24" step="1"> Uhr</span></label>
+        <p class="muted small">Netzanlagen mit Speicher: In diesem Zeitfenster deckt die Batterie den Bedarf, außerhalb wird Netz/Solar
+          bevorzugt (schont den Speicher für die bevorzugte Zeit). 0–24 Uhr = immer (Standard, wie bisher). Beispiele: 18–6 Uhr
+          „nachts aus der Batterie, tags Netz/Solar laden"; 6–18 Uhr „tags Batterie, abends Netz für Kochen etc."; 17–23 Uhr
+          „abends Batterie, wenn zuhause".</p>
         <label>Notizen<textarea id="setNotes" rows="5"></textarea></label>
         <div class="row">
           <button class="btn" id="btnExport">Als Datei exportieren</button>
@@ -162,6 +174,15 @@
       <div class="modal-head"><h2>Autom. Fertigstellen – Ergebnis</h2><button class="btn ghost icon" data-close>✕</button></div>
       <div class="build-body" id="buildBody"></div>
       <div class="modal-foot"><span class="muted small">Rückgängig: Strg+Z</span><div class="spacer"></div><button class="btn" id="buildToAnalysis">Zur Analyse</button><button class="btn primary" data-close>Schließen</button></div>
+    </div>
+  </div>
+
+  <!-- Lösungsauswahl bei Hinweisen mit mehreren Lösungswegen -->
+  <div class="modal" id="choiceModal" hidden>
+    <div class="modal-box">
+      <div class="modal-head"><h2 id="choiceTitle"></h2><button class="btn ghost icon" data-close>✕</button></div>
+      <div class="choice-body" id="choiceBody"></div>
+      <div class="modal-foot"><button class="btn" data-close>Nichts ändern</button></div>
     </div>
   </div>
 

@@ -12,6 +12,8 @@ const state = {
   lib: [], libById: {},
   project: null,
   sel: null, // { kind: 'inst'|'wire', id }
+  multiSel: new Set(), // mehrfach ausgewählte Instanz-IDs (im Mehrfachauswahl-Modus), zum gemeinsamen Löschen
+  marqueeMode: false, // Umschalter "Mehrfachauswahl" in der Werkzeugleiste
   zoom: ZOOM_BASE, panX: 80, panY: 80,
   analysis: null,
   dirty: false,
@@ -66,7 +68,7 @@ const isTyping = (e) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagNam
 
 // ---------- Projekt & Verlauf ----------
 function emptyProject() {
-  return { id: null, name: '', instances: [], wires: [], settings: { plz: '', coords: '', yieldOverride: '', tMin: -10, autonomy: 2 }, view: {}, notes: '' };
+  return { id: null, name: '', instances: [], wires: [], settings: { plz: '', coords: '', yieldOverride: '', tMin: -10, autonomy: 2, battPrefStart: 0, battPrefEnd: 24 }, view: {}, notes: '' };
 }
 function snapshot() { return JSON.stringify({ i: state.project.instances, w: state.project.wires }); }
 function commit() {
@@ -83,6 +85,7 @@ function restore(snap) {
   state.project.instances = s.i; state.project.wires = s.w;
   state.lastSnap = snap;
   if (state.sel && !(state.sel.kind === 'inst' ? instById(state.sel.id) : wireById(state.sel.id))) state.sel = null;
+  for (const id of state.multiSel) if (!instById(id)) state.multiSel.delete(id);
   setDirty(true); renderCanvas(); renderProps(); scheduleAnalysis();
 }
 function undo() { if (!state.past.length) return; state.future.push(state.lastSnap); restore(state.past.pop()); }
@@ -92,7 +95,7 @@ function setDirty(d) { state.dirty = d; $('#dirty').hidden = !d; }
 function loadProject(p) {
   state.project = Object.assign(emptyProject(), p);
   state.project.settings = Object.assign(emptyProject().settings, p.settings || {});
-  state.sel = null; state.past = []; state.future = [];
+  state.sel = null; state.multiSel = new Set(); state.past = []; state.future = [];
   state.lastSnap = snapshot();
   const v = p.view || {};
   if (v.zoom) { state.zoom = v.zoom; state.panX = v.panX; state.panY = v.panY; }
@@ -341,7 +344,7 @@ function renderCanvas() {
     const t = C.types[prod.type];
     const s = E.instSize(inst, t);
     const x0 = inst.x - s.w / 2, y0 = inst.y - s.h / 2;
-    const g = svg('g', { class: 'inst' + (inst.bestand ? ' bestand' : '') + (state.sel && state.sel.kind === 'inst' && state.sel.id === inst.id ? ' sel' : ''), 'data-inst': inst.id });
+    const g = svg('g', { class: 'inst' + (inst.bestand ? ' bestand' : '') + (state.sel && state.sel.kind === 'inst' && state.sel.id === inst.id ? ' sel' : '') + (state.multiSel.has(inst.id) ? ' multi-sel' : ''), 'data-inst': inst.id });
     g.append(svg('rect', { class: 'body', x: x0, y: y0, width: s.w, height: s.h, rx: 3 }));
     const compact = s.h < 22 || s.w < 40;
     if (!compact) {
@@ -439,7 +442,9 @@ canvas.addEventListener('pointerdown', (e) => {
   const instEl = e.target.closest('[data-inst]');
   const wireEl = e.target.closest('[data-wire]');
   const w = toWorld(e.clientX, e.clientY);
-  if (e.button === 1 || (!portEl && !instEl && !wireEl)) {
+  if (e.button === 0 && state.marqueeMode && !portEl && !instEl && !wireEl) {
+    drag = { mode: 'marquee', sx: w.x, sy: w.y, ex: w.x, ey: w.y };
+  } else if (e.button === 1 || (!portEl && !instEl && !wireEl)) {
     drag = { mode: 'pan', sx: e.clientX, sy: e.clientY, px: state.panX, py: state.panY, moved: false };
     canvas.classList.add('panning');
   } else if (portEl) {
@@ -450,8 +455,16 @@ canvas.addEventListener('pointerdown', (e) => {
     markTargets(inst, port);
   } else if (instEl) {
     const inst = instById(instEl.dataset.inst);
-    select({ kind: 'inst', id: inst.id });
-    drag = { mode: 'move', inst, ox: w.x - inst.x, oy: w.y - inst.y, moved: false };
+    if (state.multiSel.size > 1 && state.multiSel.has(inst.id)) {
+      // Klick+Ziehen auf ein Bauteil der aktuellen Mehrfachauswahl verschiebt die ganze Gruppe gemeinsam.
+      const starts = new Map();
+      for (const id of state.multiSel) { const i = instById(id); if (i) starts.set(id, { x: i.x, y: i.y }); }
+      drag = { mode: 'move-group', anchor: inst, ax: inst.x, ay: inst.y, ox: w.x - inst.x, oy: w.y - inst.y, starts, moved: false };
+    } else {
+      // Klick auf ein Bauteil außerhalb der Mehrfachauswahl: normale Einzelauswahl, hebt die Gruppe auf.
+      select({ kind: 'inst', id: inst.id });
+      drag = { mode: 'move', inst, ox: w.x - inst.x, oy: w.y - inst.y, moved: false };
+    }
   } else if (wireEl) {
     select({ kind: 'wire', id: wireEl.dataset.wire });
     drag = null;
@@ -470,9 +483,21 @@ canvas.addEventListener('pointermove', (e) => {
   } else if (drag.mode === 'move') {
     const p = snapPos(drag.inst, w.x - drag.ox, w.y - drag.oy);
     if (p.x !== drag.inst.x || p.y !== drag.inst.y) { drag.inst.x = p.x; drag.inst.y = p.y; drag.moved = true; renderCanvas(); }
+  } else if (drag.mode === 'move-group') {
+    const p = snapPos(drag.anchor, w.x - drag.ox, w.y - drag.oy);
+    const dx = p.x - drag.ax, dy = p.y - drag.ay;
+    if (dx || dy) {
+      for (const [id, s0] of drag.starts) { const i = instById(id); if (i) { i.x = s0.x + dx; i.y = s0.y + dy; } }
+      drag.moved = true; renderCanvas();
+    }
   } else if (drag.mode === 'wire') {
     const { d } = bezier(drag.from, { x: w.x, y: w.y, nx: 0, ny: 0 });
     $('#tempLayer').replaceChildren(svg('path', { class: 'temp-wire', d, 'stroke-width': 1, 'pointer-events': 'none' }));
+  } else if (drag.mode === 'marquee') {
+    drag.ex = w.x; drag.ey = w.y;
+    const x = Math.min(drag.sx, drag.ex), y = Math.min(drag.sy, drag.ey);
+    const mw = Math.abs(drag.ex - drag.sx), mh = Math.abs(drag.ey - drag.sy);
+    $('#tempLayer').replaceChildren(svg('rect', { class: 'marquee', x, y, width: mw, height: mh, 'pointer-events': 'none' }));
   }
 });
 
@@ -482,13 +507,36 @@ canvas.addEventListener('pointerup', (e) => {
   drag = null;
   canvas.classList.remove('panning');
   if (d.mode === 'pan' && !d.moved) select(null);
-  if (d.mode === 'move' && d.moved) commit();
+  if ((d.mode === 'move' || d.mode === 'move-group') && d.moved) commit();
   if (d.mode === 'wire') {
     $('#tempLayer').replaceChildren();
     clearTargets();
     const target = document.elementFromPoint(e.clientX, e.clientY);
     const portEl = target && target.closest('.port');
     if (portEl) connect(d.inst, d.port, instById(portEl.dataset.inst), portEl.dataset.port);
+  }
+  if (d.mode === 'marquee') {
+    $('#tempLayer').replaceChildren();
+    const x0 = Math.min(d.sx, d.ex), x1 = Math.max(d.sx, d.ex);
+    const y0 = Math.min(d.sy, d.ey), y1 = Math.max(d.sy, d.ey);
+    if (x1 - x0 > 1 || y1 - y0 > 1) {
+      state.sel = null;
+      state.multiSel.clear();
+      for (const inst of state.project.instances) {
+        const t = typeOf(inst); if (!t) continue;
+        const s = E.instSize(inst, t);
+        const ix0 = inst.x - s.w / 2, ix1 = inst.x + s.w / 2, iy0 = inst.y - s.h / 2, iy1 = inst.y + s.h / 2;
+        if (ix1 >= x0 && ix0 <= x1 && iy1 >= y0 && iy0 <= y1) state.multiSel.add(inst.id);
+      }
+      renderCanvas(); renderProps();
+      if (state.multiSel.size) {
+        toast(`${state.multiSel.size} Element(e) ausgewählt – Entf zum Löschen`);
+        if (state.tab !== 'props') showTab('props');
+      }
+    } else if (state.multiSel.size) {
+      state.multiSel.clear();
+      renderCanvas(); renderProps();
+    }
   }
 });
 
@@ -549,6 +597,14 @@ function addInstance(p, x, y) {
   commit(); renderProps();
 }
 function removeSelected() {
+  if (state.multiSel.size) {
+    const ids = state.multiSel;
+    state.project.instances = state.project.instances.filter((i) => !ids.has(i.id));
+    state.project.wires = state.project.wires.filter((w) => !ids.has(w.a.inst) && !ids.has(w.b.inst));
+    state.multiSel = new Set();
+    commit(); renderProps();
+    return;
+  }
   const s = state.sel;
   if (!s) return;
   if (s.kind === 'inst') {
@@ -576,6 +632,7 @@ function duplicateSelected() {
 }
 function select(sel) {
   state.sel = sel;
+  state.multiSel.clear();
   renderCanvas(); renderProps();
   if (sel && state.tab !== 'props') showTab('props');
 }
@@ -589,7 +646,7 @@ window.addEventListener('keydown', (e) => {
   else if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelected(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); removeSelected(); }
   else if (e.key.toLowerCase() === 'r' && !mod) rotateSelected();
-  else if (e.key === 'Escape') { select(null); $('#productModal').hidden = true; $('#openModal').hidden = true; $('#buildModal').hidden = true; }
+  else if (e.key === 'Escape') { select(null); if (state.marqueeMode) setMarqueeMode(false); $('#productModal').hidden = true; $('#openModal').hidden = true; $('#buildModal').hidden = true; }
 });
 
 // ---------- Rechte Spalte ----------
@@ -617,6 +674,12 @@ function fieldInput(f, value, onChange) {
 function renderProps() {
   const box = $('#tab-props');
   const s = state.sel;
+  if (state.multiSel.size) {
+    const btn = el('button', { class: 'btn danger', text: `${state.multiSel.size} Element(e) löschen` });
+    btn.addEventListener('click', removeSelected);
+    return box.replaceChildren(el('div', { class: 'p-head' }, el('div', {}, el('div', { class: 'ty', text: 'Mehrfachauswahl' }),
+      el('div', { class: 'nm', text: `${state.multiSel.size} Elemente ausgewählt` }))), btn);
+  }
   if (!s) return box.replaceChildren(helpPanel());
   if (s.kind === 'inst') {
     const inst = instById(s.id);
@@ -802,23 +865,56 @@ function runAnalysis() {
 
 const SEV_LABEL = { error: 'Fehler', warn: 'Warnung', tip: 'Tipp', ok: 'OK', info: 'Info' };
 function findingEl(f, open) {
+  f.auto = f.auto || null; f.choices = f.choices || [];
   const body = el('div', { class: 'fbody' },
     f.why.length ? [el('h4', { text: 'Warum' }), el('ul', {}, f.why.map((x) => el('li', { text: x })))] : null,
     f.fix.length ? [el('h4', { text: f.sev === 'tip' && f.title.includes('Verschaltungen') ? 'Möglichkeiten' : 'Was tun' }), el('ul', {}, f.fix.map((x) => el('li', { text: x })))] : null,
-    (f.refs.length || f.auto) ? el('div', { class: 'row' },
+    (f.refs.length || f.auto || f.choices.length) ? el('div', { class: 'row' },
       f.refs.length ? el('button', { class: 'btn small', type: 'button', text: 'Im Plan zeigen', onclick: () => focusRef(f.refs[0]) }) : null,
       f.auto ? el('button', { class: 'btn small primary', type: 'button', text: '✨ Auto-Korrektur', title: f.auto.label, onclick: () => applyAuto(f.auto, true) }) : null,
-      f.auto ? el('span', { class: 'muted small auto-label', text: f.auto.label }) : null) : null);
+      f.auto ? el('span', { class: 'muted small auto-label', text: f.auto.label }) : null,
+      f.choices.length ? el('button', { class: 'btn small primary', type: 'button', text: '✨ Lösung wählen', onclick: () => openChoiceModal(f) }) : null) : null);
   // Aufklappbar kenntlich machen: Pfeil rechts und eine Zeile, was sich darunter verbirgt
   const more = [f.why.length ? 'Warum' : null, f.fix.length ? 'Was tun' : null].filter(Boolean).join(' · ');
-  const hasBody = Boolean(more || f.auto || f.refs.length);
+  const hasBody = Boolean(more || f.auto || f.choices.length || f.refs.length);
   return el('details', { class: 'finding ' + f.sev + (hasBody ? '' : ' leer'), open: open || null },
     el('summary', { title: hasBody ? 'Klicken zum Auf-/Zuklappen' : null },
       el('span', { class: 'sev', text: SEV_LABEL[f.sev] }), el('span', { class: 'ft', text: f.title }),
       hasBody ? el('span', { class: 'chev', 'aria-hidden': 'true', text: '▾' }) : null,
       f.text ? el('span', { class: 'fx', text: f.text }) : null,
-      hasBody ? el('span', { class: 'more' }, more ? el('span', { text: '▸ ' + more }) : null, f.auto ? el('span', { class: 'more-auto', text: '✨ Auto-Korrektur möglich' }) : null) : null),
+      hasBody ? el('span', { class: 'more' }, more ? el('span', { text: '▸ ' + more }) : null,
+        f.auto ? el('span', { class: 'more-auto', text: '✨ Auto-Korrektur möglich' }) : null,
+        f.choices.length ? el('span', { class: 'more-auto', text: '✨ Mehrere Lösungswege wählbar' }) : null) : null),
     body);
+}
+
+// Hinweise mit mehreren gleichwertigen Lösungswegen: zeigt jede Option mit Auswirkung-falls-nicht-umgesetzt
+// und ob der Betrieb auch unverändert gefahrlos möglich ist, bevor etwas angewendet wird.
+function openChoiceModal(f) {
+  const allSafe = f.choices.every((c) => c.safe !== false);
+  const safeNote = el('p', { class: 'choice-safe' + (allSafe ? '' : ' unsafe') },
+    allSafe
+      ? '✓ Auch ohne Änderung läuft die Anlage weiter gefahrlos – es geht hier nur um Wirtschaftlichkeit/Komfort, nicht um Sicherheit.'
+      : '⚠ Mindestens eine Option betrifft die Sicherheit – bitte die Hinweise unten genau lesen.');
+  const items = f.choices.map((c) => {
+    const btn = el('button', {
+      class: 'btn primary', type: 'button',
+      text: c.auto ? c.label : c.label + ' (von Hand)',
+      title: c.auto ? c.auto.label : 'Keine automatische Korrektur möglich – von Hand umsetzen.',
+      onclick: async () => {
+        $('#choiceModal').hidden = true;
+        if (c.auto) { if (await applyAuto(c.auto, true)) return; }
+        toast(c.auto ? 'Automatische Korrektur fehlgeschlagen' : 'Bitte von Hand umsetzen: ' + c.label, !c.auto);
+      },
+    });
+    return el('div', { class: 'choice-item' }, btn,
+      el('p', {}, el('strong', { text: 'Falls nicht umgesetzt: ' }), c.consequence));
+  });
+  $('#choiceTitle').textContent = f.title;
+  $('#choiceBody').replaceChildren(
+    f.text ? el('p', { class: 'muted', text: f.text }) : null,
+    safeNote, ...items);
+  $('#choiceModal').hidden = false;
 }
 // ---------- Auto-Korrektur ----------
 async function ensureProduct(spec) {
@@ -837,6 +933,54 @@ async function applyAuto(a, single) {
   try {
     // Neu planen (Batteriebank vergrößern, Strangsicherungen): läuft über „Autom. Fertigstellen"
     if (a.op === 'rebuild') { await autoComplete(); return true; }
+    if (a.op === 'setSetting') {
+      state.project.settings = Object.assign({}, state.project.settings, { [a.key]: a.value });
+      commit();
+      await autoComplete(true);
+      return true;
+    }
+    if (a.op === 'splitMicro') {
+      const old = instById(a.inst);
+      if (!old) return false;
+      const pid = await ensureProduct(a.spec);
+      const prod = state.libById[pid];
+      const nIn = Math.max(1, Number(prod.inputs || 1));
+      const oldPorts = typeOf(old).ports(productOf(old)).filter((p) => /^pv\d+\+$/.test(p.id));
+      // je Eingang des alten Geräts: angeschlossenes Modul (über den Plus-Pol) finden
+      const modIds = [];
+      for (const pPlus of oldPorts) {
+        const k = pPlus.id.slice(2, -1);
+        const wPlus = state.project.wires.find((w) => (w.a.inst === old.id && w.a.port === `pv${k}+`) || (w.b.inst === old.id && w.b.port === `pv${k}+`));
+        if (wPlus) modIds.push(wPlus.a.inst === old.id ? wPlus.b.inst : wPlus.a.inst);
+      }
+      if (!modIds.length) return false;
+      const acWire = state.project.wires.find((w) => (w.a.inst === old.id && w.a.port === 'ac') || (w.b.inst === old.id && w.b.port === 'ac'));
+      const acOther = acWire ? (acWire.a.inst === old.id ? acWire.b : acWire.a) : null;
+      state.project.wires = state.project.wires.filter((w) => w.a.inst !== old.id && w.b.inst !== old.id);
+      state.project.instances = state.project.instances.filter((i) => i.id !== old.id);
+      const acPort = acOther && typeOf(instById(acOther.inst)).ports(productOf(instById(acOther.inst))).find((p) => p.id === acOther.port);
+      for (let g = 0; g * nIn < modIds.length; g++) {
+        const grp = modIds.slice(g * nIn, g * nIn + nIn);
+        const mi = { id: uid(), productId: pid, x: old.x, y: old.y + g * 130, rot: 0, label: '', props: C.instDefaults('micro', prod), auto: old.auto || false };
+        state.project.instances.push(mi);
+        const miPorts = typeOf(mi).ports(prod);
+        grp.forEach((modId, idx) => {
+          const mod = instById(modId);
+          const modPlus = typeOf(mod).ports(productOf(mod)).find((p) => p.id === '+');
+          const modMinus = typeOf(mod).ports(productOf(mod)).find((p) => p.id === '-');
+          const inPlus = miPorts.find((p) => p.id === `pv${idx + 1}+`);
+          const inMinus = miPorts.find((p) => p.id === `pv${idx + 1}-`);
+          state.project.wires.push({ id: uid(), a: { inst: modId, port: '+' }, b: { inst: mi.id, port: inPlus.id }, cableId: (defaultCable(modPlus, inPlus) || {}).id || null, lengthMode: 'auto', length: null });
+          state.project.wires.push({ id: uid(), a: { inst: modId, port: '-' }, b: { inst: mi.id, port: inMinus.id }, cableId: (defaultCable(modMinus, inMinus) || {}).id || null, lengthMode: 'auto', length: null });
+        });
+        if (acOther) {
+          const miAc = miPorts.find((p) => p.id === 'ac');
+          state.project.wires.push({ id: uid(), a: { inst: mi.id, port: 'ac' }, b: { inst: acOther.inst, port: acOther.port }, cableId: (defaultCable(miAc, acPort) || {}).id || null, lengthMode: 'auto', length: null });
+        }
+      }
+      commit(); renderProps(); runAnalysis(); toast('✓ ' + a.label);
+      return true;
+    }
     if (a.op === 'addModules') {
       const mods = state.project.instances.filter((i) => i.productId === a.productId);
       const maxY = Math.max(0, ...mods.map((i) => i.y));
@@ -1071,6 +1215,8 @@ function renderProjectTab() {
   $('#setYield').value = s.yieldOverride || '';
   $('#setTmin').value = s.tMin;
   $('#setAutonomy').value = s.autonomy;
+  $('#setBattPrefStart').value = s.battPrefStart !== undefined ? s.battPrefStart : 0;
+  $('#setBattPrefEnd').value = s.battPrefEnd !== undefined ? s.battPrefEnd : 24;
   $('#setNotes').value = state.project.notes || '';
   updateRegion();
   renderPlanTab();
@@ -1085,6 +1231,8 @@ const bindSetting = (id, key, num) => $(id).addEventListener('change', () => {
   state.project.settings[key] = num ? (v === '' ? '' : Number(v)) : v.trim();
   if (key === 'tMin' && state.project.settings.tMin === '') state.project.settings.tMin = -10;
   if (key === 'autonomy' && state.project.settings.autonomy === '') state.project.settings.autonomy = 2;
+  if (key === 'battPrefStart' && state.project.settings.battPrefStart === '') state.project.settings.battPrefStart = 0;
+  if (key === 'battPrefEnd' && state.project.settings.battPrefEnd === '') state.project.settings.battPrefEnd = 24;
   setDirty(true); updateRegion(); scheduleAnalysis();
 });
 bindSetting('#setPlz', 'plz'); bindSetting('#setCoords', 'coords');
@@ -1097,6 +1245,7 @@ $('#btnGeo').addEventListener('click', () => {
     setDirty(true); updateRegion(); scheduleAnalysis();
   }, () => toast('Standort nicht verfügbar – Koordinaten bitte von Hand eintragen (z. B. aus Google Maps: Rechtsklick auf den Ort)', true), { timeout: 10000 });
 }); bindSetting('#setYield', 'yieldOverride', true); bindSetting('#setTmin', 'tMin', true); bindSetting('#setAutonomy', 'autonomy', true);
+bindSetting('#setBattPrefStart', 'battPrefStart', true); bindSetting('#setBattPrefEnd', 'battPrefEnd', true);
 $('#setNotes').addEventListener('change', () => { state.project.notes = $('#setNotes').value; setDirty(true); });
 $('#projName').addEventListener('input', () => setDirty(true));
 
@@ -1105,6 +1254,13 @@ $('#btnSave').addEventListener('click', () => save(false));
 $('#btnSaveAs').addEventListener('click', () => save(true));
 $('#btnUndo').addEventListener('click', undo);
 $('#btnRedo').addEventListener('click', redo);
+function setMarqueeMode(on) {
+  state.marqueeMode = on;
+  $('#marqueeToggle').checked = on;
+  canvas.classList.toggle('marquee-mode', on);
+  if (!on) { state.multiSel.clear(); renderCanvas(); renderProps(); }
+}
+$('#marqueeToggle').addEventListener('change', () => setMarqueeMode($('#marqueeToggle').checked));
 $('#btnNew').addEventListener('click', () => { if (confirmDiscard()) { loadProject(emptyProject()); state.zoom = ZOOM_BASE; state.panX = 80; state.panY = 80; applyView(); } });
 $('#btnOpen').addEventListener('click', async () => {
   try {
